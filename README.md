@@ -16,19 +16,22 @@ in the paper.
 .
 ├── source/                     
 ├── simulations/
-│   ├── Circles/               
+│   ├── Circles/   
+│   ├── Equal_intensity_simulation/   
 │   ├── Instrument/         
-│   ├── orbit5k/              
+│   ├── orbit5k/   
 │   └── Torus/
 ├── Per_Image_testing/
 │   ├── PI_orbit5k_data/
 │   ├── PI_circle_data/
+│   ├── PI_Equal_intensity_data/
 │   └── PI_Torus_data/
 ├── results/
 │   ├── figures/
 │   │   └── figure_file/
 │   └── simulation_results/
 │       ├── Circle_results/
+│       ├── Equal_intensity_results/
 │       ├── Torus_results/
 │       └── Orbit5k_results/
 ├── data/
@@ -54,6 +57,7 @@ The implementation of the aggregation procedure is adapted from the MMDAgg code 
 This directory contains scripts for the simulation studies.
 
 - `Circles/` – Circles simulation experiment.
+- `Equal_intensity_simulation/` - Simulation using data whose intensity functions are identical.
 - `Instrument/` – Musical instrument experiment (flute vs. clarinet).
 - `orbit5k/` – ORBIT5K simulation experiment.
 - `Torus/` – Torus simulation experiment.
