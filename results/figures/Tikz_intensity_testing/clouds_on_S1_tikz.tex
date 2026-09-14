@@ -6,9 +6,14 @@
 \begin{tikzpicture}[font=\small]
 
 \def\globalscale{0.18}
-\def\labely{-4.5} % �� 모든 label의 공통 y좌표
+\def\labely{-4.5}       % (b,d) 설명의 공통 y좌표
+\def\panelLabelY{3.3}   % A, B, C, D의 공통 y좌표
 
-\newcommand{\CircleExample}[3]{%
+% #1: b
+% #2: d
+% #3: horizontal shift
+% #4: panel label
+\newcommand{\CircleExample}[4]{%
 \begin{scope}[shift={(#3,0)}]
 
     \pgfmathsetmacro{\b}{#1}
@@ -20,30 +25,40 @@
     \pgfmathtruncatemacro{\N}{ceil(\ratio)}
     \pgfmathtruncatemacro{\NmOne}{\N-1}
 
-    \pgfmathsetmacro{\ptsize}{ifthenelse(\N>120,0.45,
-                             ifthenelse(\N>50,0.65,
-                             ifthenelse(\N>20,0.9,1.5)))}
-
-    % circle
-    \draw[gray!70] (0,0) circle (\R);
-
-    % points
-    \foreach \k in {0,...,\NmOne} {
-        \fill ({\R*cos(90 + \k*\theta)},
-              {\R*sin(90 + \k*\theta)})
-              circle (\ptsize pt);
+    \pgfmathsetmacro{\ptsize}{
+        ifthenelse(\N>120,0.45,
+        ifthenelse(\N>50,0.65,
+        ifthenelse(\N>20,0.9,1.5)))
     }
 
-    % �� 고정된 y 위치로 label
-    \node[font=\Large] at (0,\labely) {$\displaystyle (b,d)=(#1,#2)$};
+    % Panel label
+    \node[
+        anchor=north west,
+        font=\bfseries\Large
+    ] at ({-\R-0.25},\panelLabelY) {#4};
+
+    % Circle
+    \draw[gray!70] (0,0) circle (\R);
+
+    % Points
+    \foreach \k in {0,...,\NmOne} {
+        \fill (
+            {\R*cos(90 + \k*\theta)},
+            {\R*sin(90 + \k*\theta)}
+        ) circle (\ptsize pt);
+    }
+
+    % Parameter label
+    \node[font=\Large] at (0,\labely)
+        {$\displaystyle (b,d)=(#1,#2)$};
 
 \end{scope}
 }
 
-\CircleExample{1}{10}{0}
-\CircleExample{1}{8}{4.8}
-\CircleExample{9.5}{11}{9.5}
-\CircleExample{3}{15}{15.5}
+\CircleExample{1}{10}{0}{A}
+\CircleExample{1}{8}{4.8}{B}
+\CircleExample{9.5}{11}{9.5}{C}
+\CircleExample{3}{15}{15.5}{D}
 
 \end{tikzpicture}
 \end{document}

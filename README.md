@@ -2,7 +2,7 @@
 
 This repository contains the code used in the paper
 
-**“A Two-Sample Test for Random Persistence Diagrams Against Alternatives Characterized by Persistence Intensity Differences.”**
+**“A Two-Sample Test on Weighted Persistence Intensity Functions in Topological Data Analysis”**
 
 The proposed method performs two-sample testing for persistence
 intensity functions using kernel-based test statistics and permutation
