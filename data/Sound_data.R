@@ -188,9 +188,22 @@ figure3=ggplot(data.frame(a,col="a"))+
   axis.text.y = element_blank()
 )
 
-### ---- PATCHWORK----
 
-combined_plot <- (figure1 / (figure2 | figure3)) +
+tag_theme <- theme(
+  plot.tag = element_text(
+    size = 20,
+    face = "bold",
+    colour = "black"
+  ),
+  plot.tag.position = c(0.01, 0.99),
+  plot.margin = margin(t = 12, r = 8, b = 8, l = 12)
+)
+
+figure1 <- figure1 + labs(tag = "A") + tag_theme
+figure2 <- figure2 + labs(tag = "B") + tag_theme
+figure3 <- figure3 + labs(tag = "C") + tag_theme
+
+combined_plot <- figure1 / (figure2 | figure3) +
   plot_layout(heights = c(1, 1))
 
 ### ---- SAVE ----
