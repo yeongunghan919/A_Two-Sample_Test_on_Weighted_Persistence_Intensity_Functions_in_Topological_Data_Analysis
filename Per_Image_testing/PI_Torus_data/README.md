@@ -6,7 +6,7 @@ This directory contains **[Persistence images for the Torus simulation]**.
 
 The generated files include:
 
-* `[torus_pi_linear_shift_*.rds]`: [Persistence images of the torus data using the linear weight.]
+* `[torus_radius_shift/torus_pi_linear_shift_*.rds]`: [Persistence images of the torus data using the linear weight.]
 
 ## How to Generate
 
