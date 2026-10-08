@@ -5,8 +5,7 @@ This repository contains the code used in the paper
 **“A Two-Sample Test on Weighted Persistence Intensity Functions in Topological Data Analysis”**
 
 The proposed method performs two-sample testing for persistence
-intensity functions using kernel-based test statistics and permutation
-calibration. The repository also contains implementations of competing
+intensity functions using kernel-based test statistics. The repository also contains implementations of competing
 methods and scripts for the simulation and real-data experiments presented
 in the paper.
 
@@ -16,29 +15,26 @@ in the paper.
 .
 ├── source/                     
 ├── simulations/
-│   ├── Circles/   
 │   ├── Equal_intensity_simulation/   
 │   ├── Instrument/         
 │   ├── orbit5k/   
 │   └── Torus/
 ├── Per_Image_testing/
 │   ├── PI_orbit5k_data/
-│   ├── PI_circle_data/
 │   ├── PI_Equal_intensity_data/
 │   └── PI_Torus_data/
 ├── results/
 │   ├── figures/
 │   │   └── figure_file/
 │   └── simulation_results/
-│       ├── Circle_results/
 │       ├── Equal_intensity_results/
 │       ├── Torus_results/
 │       └── Orbit5k_results/
 ├── data/
 │   ├── clarinet_diagrams/                
 │   ├── flute_diagrams/          
-│   ├── json/ 
 │   ├── orbit_data/
+│   ├── PLdata/
 │   └── Rdata
 ├── Figures.ipynb              
 └── README.md
@@ -49,14 +45,12 @@ in the paper.
 ### `source/`
 
 This directory contains Python modules implementing the proposed bandwidth-aggregated two-sample test and other competing methods. 
-The implementation of the aggregation procedure is adapted from the MMDAgg code of Schrab et al. (2023), with modifications for persistence intensity functions.
 
 
 ### `simulations/`
 
 This directory contains scripts for the simulation studies.
 
-- `Circles/` – Circles simulation experiment.
 - `Equal_intensity_simulation/` - Simulation using data whose intensity functions are identical.
 - `Instrument/` – Musical instrument experiment (flute vs. clarinet).
 - `orbit5k/` – ORBIT5K simulation experiment.

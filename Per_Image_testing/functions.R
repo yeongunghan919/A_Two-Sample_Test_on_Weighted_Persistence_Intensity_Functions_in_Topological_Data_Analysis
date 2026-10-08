@@ -163,7 +163,7 @@ ts_main_fpr_using_pair_block = function(twopi, sig, npc, nset, npair, range, res
         pvals[ii,jj,cc] =
           (min(p.adjust(
             df.pval.sd$pval,
-            method = "BH"
+            method = "bonferroni"
           )) < alpha) * 1
       }
     }
@@ -205,15 +205,15 @@ ttestpi = function(group1,group2,res,cc=0.5) {
   df.pval.rm$sdrank= (rank(df.pval.rm$oversd)/npix)
   df.pval.sd=df.pval.rm[df.pval.rm$sdrank>cc,]
   
-  # BH correction
+  # bonferroni correction
   ## sd
-  df.pval.sd$BH=p.adjust(df.pval.sd$pval,method=c("BH"))
+  df.pval.sd$bonferroni=p.adjust(df.pval.sd$pval,method=c("bonferroni"))
   
   df.new.sd=df.pval %>%
     select(idx,idy) %>%
     left_join(df.pval.sd,by=c("idx"="idx","idy"="idy"))
   
-  return(min(df.new.sd$BH,na.rm=T))
+  return(min(df.new.sd$bonferroni,na.rm=T))
 }
 
 
@@ -294,7 +294,7 @@ ts_main_power = function(onepi,twopi,sig,npc,nset,range,res,alpha){
       for (cc in 1:length(C)) {
         df.pval.rm$sdrank= (rank(df.pval.rm$oversd)/npix)
         df.pval.sd=df.pval.rm[df.pval.rm$sdrank>C[cc],]
-        pvals[ii,jj,cc]=(min(p.adjust(df.pval.sd$pval,method=c("BH")))<alpha)*1
+        pvals[ii,jj,cc]=(min(p.adjust(df.pval.sd$pval,method=c("bonferroni")))<alpha)*1
       }
     }
   }
@@ -390,7 +390,7 @@ ts_main_power_using_pair_block = function(
       for (cc in 1:length(C)) {
         df.pval.rm$sdrank= (rank(df.pval.rm$oversd)/npix)
         df.pval.sd=df.pval.rm[df.pval.rm$sdrank>C[cc],]
-        pvals[ii,jj,cc]=(min(p.adjust(df.pval.sd$pval,method=c("BH")))<alpha)*1
+        pvals[ii,jj,cc]=(min(p.adjust(df.pval.sd$pval,method=c("bonferroni")))<alpha)*1
       }
     }
   }

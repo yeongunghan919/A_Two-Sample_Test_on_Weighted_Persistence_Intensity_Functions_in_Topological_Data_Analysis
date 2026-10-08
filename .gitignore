@@ -3,6 +3,7 @@
 #Data
 *.pkl
 *.RData
+*.rds
 .RDataTmp*
 *.json
 *.csv

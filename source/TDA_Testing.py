@@ -14,11 +14,716 @@ from persim.landscapes import (
 import random
 from ripser import ripser
 from itertools import product
+from scipy.stats import norm
 
 """
 ================================================================================
-Aggregation test for intensity functions over a collection of bandwidths
+Bonferroni test for equality of intensity functions over a collection of bandwidths
+H0:p=q vs H1:p\neq q
+================================================================================
+"""
+# ============================================================
+#  Bandwidth-aggregated Bonferroni test
+# ============================================================
 
+def estimate_bandwidth_reference(
+    sample_diagrams,
+    max_point_pairs=2_000_000
+):
+    """Estimate (r_b, r_d) from cross-diagram coordinate gaps.
+
+    Take coordinate-wise medians of absolute differences between points in
+    *different* diagrams. Each pair of nonempty diagrams receives equal total
+    weight, even when their point counts differ. With two points per diagram,
+    this equals the ordinary median of all cross-diagram point-pair gaps used
+    in the practical-bandwidth simulation. When there are more than
+    max_point_pairs cross-diagram point pairs, sample an equal number of point
+    pairs within each diagram pair, with a fixed seed for reproducibility.
+    """
+    if int(max_point_pairs) != max_point_pairs or max_point_pairs < 1:
+        raise ValueError("max_point_pairs must be a positive integer.")
+    max_point_pairs = int(max_point_pairs)
+
+    diagrams = []
+    for diagram in sample_diagrams:
+        diagram = np.asarray(diagram, dtype=float)
+        if diagram.size == 0:
+            diagram = np.empty((0, 2), dtype=float)
+        if diagram.ndim != 2 or diagram.shape[1] != 2:
+            raise ValueError("Each diagram must have shape (points, 2).")
+        if not np.all(np.isfinite(diagram)):
+            raise ValueError("Point coordinates must be finite.")
+        if len(diagram):
+            diagrams.append(diagram)
+
+    if len(diagrams) < 2:
+        raise ValueError("At least two nonempty diagrams are required.")
+
+    counts = [len(diagram) for diagram in diagrams]
+    total_pairs = sum(counts[i] * sum(counts[i + 1:])
+                      for i in range(len(counts) - 1))
+    diagram_pairs = len(diagrams) * (len(diagrams) - 1) // 2
+    if diagram_pairs > max_point_pairs:
+        raise ValueError(
+            "max_point_pairs must allow at least one point pair per "
+            "pair of nonempty diagrams."
+        )
+
+    balanced = len(set(counts)) == 1
+    subsample = total_pairs > max_point_pairs
+    if balanced and not subsample:
+        points = np.vstack(diagrams)
+        owners = np.repeat(np.arange(len(diagrams)), counts[0])
+        cross_diagram = owners[:, None] < owners[None, :]
+        differences = np.abs(points[:, None, :] - points[None, :, :])
+        reference = np.median(differences[cross_diagram], axis=0)
+    else:
+        gaps = []
+        pair_weights = []
+        rng = np.random.default_rng(0)
+        per_diagram_pair = max_point_pairs // diagram_pairs
+        for i, first in enumerate(diagrams):
+            for second in diagrams[i + 1:]:
+                count = len(first) * len(second)
+                if subsample and count > per_diagram_pair:
+                    first_ids = rng.integers(len(first), size=per_diagram_pair)
+                    second_ids = rng.integers(len(second), size=per_diagram_pair)
+                    difference = np.abs(first[first_ids] - second[second_ids])
+                else:
+                    difference = np.abs(first[:, None, :] - second[None, :, :])
+                    difference = difference.reshape(-1, 2)
+                gaps.append(difference)
+                if not balanced:
+                    # Total weight one per pair of diagrams, independently
+                    # of diagram size or the number of sampled point pairs.
+                    pair_weights.append(np.full(len(difference), 1.0 / len(difference)))
+
+        gaps = np.concatenate(gaps, axis=0)
+        if balanced:
+            reference = np.median(gaps, axis=0)
+        else:
+            weights = np.concatenate(pair_weights)
+            reference = np.empty(2, dtype=float)
+            for coordinate in range(2):
+                order = np.argsort(gaps[:, coordinate], kind="stable")
+                cumulative = np.cumsum(weights[order])
+                midpoint = 0.5 * cumulative[-1]
+                position = int(np.searchsorted(cumulative, midpoint))
+                value = gaps[order[position], coordinate]
+                # Agree with np.median when exactly half the weight lies below.
+                if (position + 1 < len(order)
+                        and np.isclose(cumulative[position], midpoint,
+                                       rtol=1e-12, atol=0.0)):
+                    value = 0.5 * (value + gaps[order[position + 1], coordinate])
+                reference[coordinate] = value
+
+    if np.any(reference <= 0.0):
+        raise ValueError("Both coordinate medians must be positive.")
+    return reference
+
+
+def practical_bandwidth_collection(n, m, reference_scales):
+    """Return the nine (2**j r_b/sqrt(N), 2**k r_d/sqrt(N)) pairs."""
+    reference = np.asarray(reference_scales, dtype=float)
+    if reference.shape != (2,) or not np.all(np.isfinite(reference)):
+        raise ValueError("reference_scales must be two finite numbers.")
+    if np.any(reference <= 0.0):
+        raise ValueError("Both reference_scales must be positive.")
+    if n + m <= 0:
+        raise ValueError("n+m must be positive.")
+
+    base = reference / np.sqrt(n + m)
+    return [
+        (float(2.0**j * base[0]), float(2.0**k * base[1]))
+        for j, k in product((-1, 0, 1), repeat=2)
+    ]
+
+
+def bonferroni_test(
+    X,
+    Y,
+    alpha=0.05,
+    func_weight=None,
+    reference_fraction=0.20,
+    reference_rng=None,
+    max_block_entries=1_000_000,
+):
+    """
+    Apply the studentized Bonferroni test with nine practical bandwidths.
+
+    Compute coordinate-wise reference scales from the current X and Y sample.
+    The bandwidth collection therefore changes with each test sample.
+
+    Parameters
+    ----------
+    X, Y : list of np.ndarray
+        Samples of persistence diagrams.
+    alpha : float
+        Significance level.
+    func_weight : callable or None
+        A function taking one point (birth, death) and returning
+        its weight. If None, the constant weight is used.
+    max_block_entries : int
+        Maximum number of point pairs processed in one memory block.
+        Reduce this value if memory is especially limited.
+
+    Returns
+    -------
+    result : dict
+        Test decision and diagnostic information.
+    """
+    X = list(X)
+    Y = list(Y)
+
+    n = len(X)
+    m = len(Y)
+
+    if n < 4 or m < 4:
+        raise ValueError(
+            "The variance estimators require n >= 4 and m >= 4."
+        )
+
+    if not (0.0 < alpha < 1.0):
+        raise ValueError("alpha must lie in (0, 1).")
+
+    # --------------------------------------------------------
+    # Data-dependent coordinate-wise scales and nine practical bandwidths
+    # --------------------------------------------------------
+    if not 0 < reference_fraction <= 1:
+        raise ValueError("reference_fraction must lie in (0, 1].")
+
+    rng = (
+        np.random.default_rng(0)
+        if reference_rng is None
+        else reference_rng
+    )
+
+    n_ref = max(1, int(np.ceil(reference_fraction * n)))
+    m_ref = max(1, int(np.ceil(reference_fraction * m)))
+
+    reference_X = [
+        X[i] for i in rng.choice(n, size=n_ref, replace=False)
+    ]
+    reference_Y = [
+        Y[j] for j in rng.choice(m, size=m_ref, replace=False)
+    ]
+
+    reference_scales = estimate_bandwidth_reference(
+        reference_X + reference_Y
+    )
+    bandwidths = practical_bandwidth_collection(
+        n, m, reference_scales
+    )
+    # reference_scales = estimate_bandwidth_reference(X + Y)
+    # bandwidths = practical_bandwidth_collection(n, m, reference_scales)
+
+    number_of_bandwidths = len(bandwidths)
+
+    critical_value = float(
+        norm.isf(alpha / number_of_bandwidths)
+    )
+
+    # --------------------------------------------------------
+    # Statistics over all bandwidths
+    # --------------------------------------------------------
+    geometry = prepare_geometry(
+        X + Y,
+        func_weight=func_weight
+    )
+
+    # Compute all Gram matrices in memory-bounded blocks.  In particular,
+    # this avoids materialising several total_points x total_points arrays.
+    grams = diagram_grams(
+        geometry,
+        bandwidths,
+        max_block_entries=max_block_entries
+    )
+
+    statistics = []
+    u_statistics = []
+    variance_estimates = []
+
+    for gram in grams:
+        statistic, u_statistic, sigma_squared = T_statistic(
+            gram,
+            n,
+            m
+        )
+
+        statistics.append(statistic)
+        u_statistics.append(u_statistic)
+        variance_estimates.append(sigma_squared)
+
+    statistics = np.asarray(statistics, dtype=float)
+    u_statistics = np.asarray(u_statistics, dtype=float)
+    variance_estimates = np.asarray(
+        variance_estimates,
+        dtype=float
+    )
+
+    valid = (
+        np.isfinite(statistics)
+        & np.isfinite(variance_estimates)
+        & (variance_estimates > 0.0)
+    )
+
+    if np.any(valid):
+        best_index = int(np.argmax(statistics))
+        maximum_statistic = float(statistics[best_index])
+        best_bandwidth = bandwidths[best_index]
+
+        adjusted_p_value = min(
+            1.0,
+            number_of_bandwidths
+            * norm.sf(maximum_statistic)
+        )
+    else:
+        maximum_statistic = -np.inf
+        best_bandwidth = None
+        adjusted_p_value = 1.0
+
+    reject = maximum_statistic > critical_value
+
+    return {
+        "reject": bool(reject),
+        "adjusted_p_value": float(adjusted_p_value),
+        # "maximum_statistic": maximum_statistic,
+        # "critical_value": critical_value,
+        # "best_bandwidth": best_bandwidth,
+        # "number_of_bandwidths": number_of_bandwidths,
+        # "number_of_invalid_variances": int(np.sum(~valid)),
+         "bandwidths": bandwidths
+        # "statistics": statistics,
+        # "u_statistics": u_statistics,
+        # "variance_estimates": variance_estimates,
+    }
+# ============================================================
+# 1. Precompute diagram geometry
+# ============================================================
+
+def prepare_geometry(diagrams, func_weight=None):
+    """
+    Precompute quantities shared across all bandwidths.
+
+    Unlike the previous implementation, this function does not construct
+    total_points x total_points distance and index matrices.  Its memory use
+    is linear in the total number of persistence points.
+
+    Parameters
+    ----------
+    diagrams : list of np.ndarray
+        Each diagram has shape (number_of_points, 2).
+    func_weight : callable or None
+        A function taking one point (birth, death) and returning
+        its weight. If None, constant weight is used.
+    """
+    if func_weight is None:
+        func_weight = function_weight("constant")
+
+    cleaned_diagrams = []
+
+    for diagram in diagrams:
+        diagram = np.asarray(diagram, dtype=float)
+
+        if diagram.size == 0:
+            diagram = np.empty((0, 2), dtype=float)
+
+        if diagram.ndim != 2 or diagram.shape[1] != 2:
+            raise ValueError(
+                "Each persistence diagram must have shape "
+                "(number_of_points, 2)."
+            )
+
+        cleaned_diagrams.append(diagram)
+
+    number_of_diagrams = len(cleaned_diagrams)
+
+    counts = np.array(
+        [len(diagram) for diagram in cleaned_diagrams],
+        dtype=int
+    )
+
+    offsets = np.concatenate((
+        np.array([0], dtype=np.int64),
+        np.cumsum(counts, dtype=np.int64)
+    ))
+
+    total_points = int(offsets[-1])
+
+    if total_points == 0:
+        points = np.empty((0, 2), dtype=float)
+    else:
+        points = np.vstack([
+            diagram
+            for diagram in cleaned_diagrams
+            if len(diagram) > 0
+        ])
+
+    owners = np.repeat(
+        np.arange(number_of_diagrams, dtype=np.int64),
+        counts
+    )
+
+    # Apply func_weight to every persistence point
+    weights = np.fromiter(
+        (func_weight(point) for point in points),
+        dtype=float,
+        count=len(points)
+    )
+
+    if not np.all(np.isfinite(weights)):
+        raise ValueError(
+            "func_weight returned a non-finite value."
+        )
+
+    return (
+        points,
+        weights,
+        owners,
+        offsets,
+        number_of_diagrams
+    )
+
+# ============================================================
+# 2. Diagram-kernel Gram matrix
+# ============================================================
+
+def diagram_grams(
+    geometry,
+    bandwidths,
+    max_block_entries=1_000_000
+):
+    """
+    Construct diagram-level Gram matrices for all bandwidths using
+    memory-bounded blocks.
+
+        k_lambda(x,y)
+          = exp[-0.5 * {
+                (x1-y1)^2/lambda_1^2
+                + (x2-y2)^2/lambda_2^2
+            }]
+            / (2*pi*lambda_1*lambda_2)
+
+    The result follows the arithmetic and accumulation order of the original
+    full-matrix implementation, but processes consecutive rows in blocks.
+    The largest point-pair array contains at most approximately
+    ``max_block_entries`` floating-point values.
+
+    Parameters
+    ----------
+    geometry : tuple
+        Output of ``prepare_geometry``.
+    bandwidths : sequence of pairs
+        Each pair is (lambda_1, lambda_2).
+    max_block_entries : int
+        Maximum number of point pairs in a processing block.  The default
+        keeps each float64 block near 8 MB.
+
+    Returns
+    -------
+    grams : np.ndarray
+        Array of shape (number_of_bandwidths, number_of_diagrams,
+        number_of_diagrams).
+    """
+    bandwidths = np.asarray(bandwidths, dtype=float)
+
+    if bandwidths.ndim != 2 or bandwidths.shape[1] != 2:
+        raise ValueError(
+            "bandwidths must have shape (number_of_bandwidths, 2)."
+        )
+
+    if len(bandwidths) == 0:
+        raise ValueError("At least one bandwidth is required.")
+
+    if not np.all(np.isfinite(bandwidths)) or np.any(bandwidths <= 0.0):
+        raise ValueError("Bandwidths must be finite and positive.")
+
+    if int(max_block_entries) != max_block_entries or max_block_entries < 1:
+        raise ValueError("max_block_entries must be a positive integer.")
+
+    max_block_entries = int(max_block_entries)
+
+    (
+        points,
+        weights,
+        owners,
+        offsets,
+        number_of_diagrams
+    ) = geometry
+
+    number_of_bandwidths = len(bandwidths)
+    grams = np.zeros(
+        (
+            number_of_bandwidths,
+            number_of_diagrams,
+            number_of_diagrams
+        ),
+        dtype=float
+    )
+
+    if len(points) == 0:
+        return grams
+
+    total_points = len(points)
+    rows_per_block = max(
+        1,
+        max_block_entries // total_points
+    )
+
+    for diagram_index in range(number_of_diagrams):
+        diagram_start = int(offsets[diagram_index])
+        diagram_stop = int(offsets[diagram_index + 1])
+
+        if diagram_start == diagram_stop:
+            continue
+
+        one_block_for_diagram = (
+            diagram_stop - diagram_start <= rows_per_block
+        )
+
+        for row_start in range(
+            diagram_start,
+            diagram_stop,
+            rows_per_block
+        ):
+            row_stop = min(
+                row_start + rows_per_block,
+                diagram_stop
+            )
+            row_points = points[row_start:row_stop]
+
+            squared_birth_differences = (
+                row_points[:, None, 0]
+                - points[None, :, 0]
+            )**2
+
+            squared_death_differences = (
+                row_points[:, None, 1]
+                - points[None, :, 1]
+            )**2
+
+            row_weights = weights[row_start:row_stop]
+            weight_products = (
+                row_weights[:, None] * weights[None, :]
+            )
+
+            # These are the diagram labels of the flattened block in C
+            # (row-major) order, matching diagram_pair_ids.ravel() in the
+            # original implementation.
+            block_owners = np.tile(
+                owners,
+                row_stop - row_start
+            )
+
+            for bandwidth_index, (
+                lambda_1,
+                lambda_2
+            ) in enumerate(bandwidths):
+                # Preserve the original order of floating-point operations:
+                # division by lambda**2, addition, multiplication by -0.5,
+                # exponential, normalization, and finally weight products.
+                weighted_point_kernel = (
+                    squared_birth_differences
+                    / lambda_1**2
+                )
+                weighted_point_kernel += (
+                    squared_death_differences
+                    / lambda_2**2
+                )
+                weighted_point_kernel *= -0.5
+                np.exp(
+                    weighted_point_kernel,
+                    out=weighted_point_kernel
+                )
+                weighted_point_kernel /= (
+                    2.0 * np.pi * lambda_1 * lambda_2
+                )
+                weighted_point_kernel *= weight_products
+
+                flattened_kernel = weighted_point_kernel.ravel()
+
+                if one_block_for_diagram:
+                    # A single bincount has exactly the same input order as
+                    # the original full-matrix implementation.
+                    grams[
+                        bandwidth_index,
+                        diagram_index,
+                        :
+                    ] = np.bincount(
+                        block_owners,
+                        weights=flattened_kernel,
+                        minlength=number_of_diagrams
+                    )
+                else:
+                    # np.add.at accumulates repeated indices sequentially.
+                    # Consequently, splitting a large diagram across blocks
+                    # does not change the original summation order.
+                    np.add.at(
+                        grams[
+                            bandwidth_index,
+                            diagram_index,
+                            :
+                        ],
+                        block_owners,
+                        flattened_kernel
+                    )
+
+    return grams
+
+
+def diagram_gram(
+    geometry,
+    lambda_1,
+    lambda_2,
+    max_block_entries=1_000_000
+):
+    """Construct one memory-bounded diagram-level Gram matrix."""
+    return diagram_grams(
+        geometry,
+        [(lambda_1, lambda_2)],
+        max_block_entries=max_block_entries
+    )[0]
+
+
+# ============================================================
+# 3. Variance-component estimators
+# ============================================================
+
+def a_hat(gram):
+    """
+    Unbiased estimator of tr(Sigma^2).
+
+    This is the O(r^2) implementation of the fourth-order
+    U-statistic estimator.
+    """
+    gram = np.asarray(gram, dtype=float)
+    r = gram.shape[0]
+
+    if gram.shape != (r, r):
+        raise ValueError("gram must be a square matrix.")
+
+    if r < 4:
+        raise ValueError("At least four diagrams are required.")
+
+    off_diagonal = gram.copy()
+    np.fill_diagonal(off_diagonal, 0.0)
+
+    row_sums = off_diagonal.sum(axis=1)
+    total_sum = row_sums.sum()
+
+    numerator = (
+        total_sum**2
+        - 2.0 * (r - 1) * np.sum(row_sums**2)
+        + (r - 1) * (r - 2)
+        * np.sum(off_diagonal**2)
+    )
+
+    denominator = r * (r - 1) * (r - 2) * (r - 3)
+
+    return float(numerator / denominator)
+
+
+def a_pq_hat(gram_xy):
+    """
+    Unbiased estimator of tr(Sigma_P Sigma_Q).
+    """
+    gram_xy = np.asarray(gram_xy, dtype=float)
+    n, m = gram_xy.shape
+
+    if n < 2 or m < 2:
+        raise ValueError(
+            "gram_xy must have at least two rows and columns."
+        )
+
+    row_sums = gram_xy.sum(axis=1)
+    column_sums = gram_xy.sum(axis=0)
+    total_sum = gram_xy.sum()
+
+    numerator = (
+        total_sum**2
+        - n * np.sum(row_sums**2)
+        - m * np.sum(column_sums**2)
+        + n * m * np.sum(gram_xy**2)
+    )
+
+    denominator = n * (n - 1) * m * (m - 1)
+
+    return float(numerator / denominator)
+
+
+# ============================================================
+# 4. Studentized statistic
+# ============================================================
+
+def T_statistic(gram, n, m):
+    """
+    Compute the studentized statistic.
+
+    Returns
+    -------
+    statistic : float
+        Studentized test statistic.
+    u_statistic : float
+        Unstudentized U-statistic.
+    sigma_squared : float
+        Estimated null variance.
+    """
+    gram = np.asarray(gram, dtype=float)
+
+    if gram.shape != (n + m, n + m):
+        raise ValueError(
+            "gram must have shape (n+m, n+m)."
+        )
+
+    gram_xx = gram[:n, :n]
+    gram_yy = gram[n:, n:]
+    gram_xy = gram[:n, n:]
+
+    sum_xx_off_diagonal = (
+        gram_xx.sum() - np.trace(gram_xx)
+    )
+
+    sum_yy_off_diagonal = (
+        gram_yy.sum() - np.trace(gram_yy)
+    )
+
+    u_statistic = (
+        sum_xx_off_diagonal / (n * (n - 1))
+        + sum_yy_off_diagonal / (m * (m - 1))
+        - 2.0 * gram_xy.sum() / (n * m)
+    )
+
+    a_p = a_hat(gram_xx)
+    a_q = a_hat(gram_yy)
+    a_pq = a_pq_hat(gram_xy)
+
+    sigma_squared = (
+        2.0 * a_p / (n * (n - 1))
+        + 2.0 * a_q / (m * (m - 1))
+        + 4.0 * a_pq / (n * m)
+    )
+
+    if (
+        not np.isfinite(sigma_squared)
+        or sigma_squared <= 0.0
+    ):
+        statistic = -np.inf
+    else:
+        statistic = u_statistic / np.sqrt(sigma_squared)
+
+    return (
+        float(statistic),
+        float(u_statistic),
+        float(sigma_squared)
+    )
+
+
+
+
+"""
+================================================================================
+Aggregated permutation test for intensity functions over a collection of bandwidths
+H0:P=Q vs H1:p\neq q
 This code is adapted from the code of Schrab et al., 2023.
 ================================================================================
 """
@@ -87,7 +792,13 @@ def Aggtest(
     assert number_bandwidths > 1 and type(number_bandwidths) == int
     assert B>0 and type(B)==int
 
-    assert weight_function is not None
+    if isinstance(weight_function, (list, tuple)):
+        weight_functions = list(weight_function)
+    else:
+        weight_functions = [weight_function]
+
+    assert len(weight_functions) > 0
+    assert all(callable(w) for w in weight_functions)
 
     if not optimal_bandwidths:
         # Coordinate-wise median-based bandwidth collections
@@ -187,21 +898,36 @@ def Aggtest(
 
         
     # Step 1: compute the statistical matrix M
-    N = number_bandwidths
+    parameter_grid = list(product(bandwidths, weight_functions))
+
+    N = len(parameter_grid)
     M = np.zeros((N, B + 1))
-    list_pd = X + Y # list concatenation
-    for i in range(number_bandwidths):
-        bandwidth = bandwidths[i]
-        K = Mat_gram(list_pd,bandwidth,weight_function,kernel,seed=seed,Rff_approx=Rff_approx,num_rff=10**4)
-        # set diagonal elements to zero
+    list_pd = X + Y
+
+    for i, (bandwidth, weight) in enumerate(parameter_grid):
+        K = Mat_gram(
+            list_pd,
+            bandwidth,
+            weight,
+            kernel,
+            seed=seed,
+            Rff_approx=Rff_approx,
+            num_rff=10**4,
+        )
+
+        # Set diagonal elements to zero
         np.fill_diagonal(K, 0)
-        # compute T permuted values
+
+        # Compute permuted test statistics
         M[i] = (
-            np.sum(V10 * (K @ V10), 0) * (m - n + 1) / (m * n * (n - 1))
-            + np.sum(V01 * (K @ V01), 0) * (n - m + 1) / (m * n * (m - 1))
+            np.sum(V10 * (K @ V10), 0)
+            * (m - n + 1) / (m * n * (n - 1))
+            + np.sum(V01 * (K @ V01), 0)
+            * (n - m + 1) / (m * n * (m - 1))
             + np.sum(V11 * (K @ V11), 0) / (m * n)
         )
-    M=M.transpose() #(B+1,N), the (B+1)th row of M corresponds the original statistic.
+
+    M = M.transpose()
 
     # Step 2: compute P-value Matrix
     def computing_rank(vector):
@@ -219,7 +945,12 @@ def Aggtest(
     # create rejection dictionary 
     reject_dictionary = {}
 
-    reject_dictionary["Bandwidth"] = bandwidths
+    reject_dictionary["Bandwidth"] = np.array(
+        [bandwidth for bandwidth, _ in parameter_grid],
+         dtype=float)
+    reject_dictionary["Weight function"] = [
+             weight for _, weight in parameter_grid
+    ]
     reject_dictionary["Stat_Matrix"] = M
     reject_dictionary["P-value_Matrix"] = Pvar_M
     reject_dictionary["AggStats"] = Agg_Stats
@@ -259,7 +990,7 @@ def Linear(diagram_1, diagram_2, vec_weight_1, vec_weight_2,kernel,bandwidth):
                   * kernel_func(diagram_1[i, :], diagram_2[j, :],bandwidth))
     return return_value
 
-def function_weight(name_weight, arc_c=1.0, arc_p=5.0, lin_el=1.0,poly_order=2):
+def function_weight(name_weight, arc_c=1.0, arc_p=1.0, lin_el=1.0,poly_order=2):
     if name_weight == "arctan":
         def func_weight(bd):
             return np.maximum(np.arctan(math.pow((bd[1] - bd[0]), arc_p) / arc_c), 0.0)
@@ -426,3 +1157,262 @@ def permutation_pl_test(pl_list1,pl_list2,seed=42,num_perms=1000):
 
     pval = (sig_count+1)/(num_perms+1)
     return pval
+
+
+def landscape_l2_gram(landscapes, start=None, stop=None):
+    """Compute the L2 Gram matrix of fixed-grid persistence landscapes.
+
+    Each item in ``landscapes`` may be either a ``PersLandscapeApprox``
+    object or a two-dimensional array with shape ``(depth, num_steps)``.
+    Landscapes with different depths are padded with zero layers, as in the
+    usual persistence-landscape arithmetic.
+
+    All landscapes must already use the same grid.  For
+    ``PersLandscapeApprox`` inputs, ``start`` and ``stop`` are inferred from
+    the objects and checked for consistency.  For raw arrays, pass ``start``
+    and ``stop`` if the absolute L2 inner products are needed.  If they are
+    omitted, unit grid spacing is used; this common rescaling does not change
+    the permutation p-value returned by ``permutation_pl_test_fast``.
+
+    Parameters
+    ----------
+    landscapes : sequence
+        Fixed-grid persistence landscapes.
+    start, stop : float or None
+        Common grid endpoints.  Supply both or neither.
+
+    Returns
+    -------
+    np.ndarray
+        Symmetric matrix whose ``(i, j)`` entry is the L2 inner product of
+        landscapes ``i`` and ``j``.
+    """
+    landscapes = list(landscapes)
+    if len(landscapes) == 0:
+        raise ValueError("At least one persistence landscape is required.")
+    if (start is None) != (stop is None):
+        raise ValueError("start and stop must be supplied together.")
+
+    values_list = []
+    object_grids = []
+    num_steps = None
+    max_depth = 0
+
+    for landscape_index, landscape in enumerate(landscapes):
+        try:
+            values = np.asarray(
+                getattr(landscape, "values", landscape),
+                dtype=float,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Landscape {landscape_index} does not contain a numeric "
+                "fixed-grid value array."
+            ) from exc
+
+        if values.ndim != 2:
+            raise ValueError(
+                f"Landscape {landscape_index} has shape {values.shape}; "
+                "expected (depth, num_steps)."
+            )
+        if values.shape[0] < 1 or values.shape[1] < 2:
+            raise ValueError(
+                f"Landscape {landscape_index} has shape {values.shape}; "
+                "depth must be positive and num_steps must be at least 2."
+            )
+        if not np.all(np.isfinite(values)):
+            raise ValueError(
+                f"Landscape {landscape_index} contains non-finite values."
+            )
+
+        if num_steps is None:
+            num_steps = values.shape[1]
+        elif values.shape[1] != num_steps:
+            raise ValueError(
+                "All landscapes must use the same number of grid points; "
+                f"landscape 0 has {num_steps}, whereas landscape "
+                f"{landscape_index} has {values.shape[1]}."
+            )
+
+        declared_num_steps = getattr(landscape, "num_steps", None)
+        if (
+            declared_num_steps is not None
+            and int(declared_num_steps) != values.shape[1]
+        ):
+            raise ValueError(
+                f"Landscape {landscape_index} declares "
+                f"num_steps={declared_num_steps}, but its values have "
+                f"{values.shape[1]} grid points."
+            )
+
+        landscape_start = getattr(landscape, "start", None)
+        landscape_stop = getattr(landscape, "stop", None)
+        if (landscape_start is None) != (landscape_stop is None):
+            raise ValueError(
+                f"Landscape {landscape_index} has incomplete grid metadata."
+            )
+        if landscape_start is not None:
+            object_grids.append(
+                (landscape_index, float(landscape_start), float(landscape_stop))
+            )
+
+        values_list.append(np.ascontiguousarray(values, dtype=float))
+        max_depth = max(max_depth, values.shape[0])
+
+    if start is None:
+        if object_grids:
+            _, grid_start, grid_stop = object_grids[0]
+        else:
+            # Raw arrays do not carry their physical grid.  Unit spacing is
+            # sufficient for the permutation p-value because every statistic
+            # is multiplied by the same positive constant.
+            grid_start = 0.0
+            grid_stop = float(num_steps - 1)
+    else:
+        grid_start = float(start)
+        grid_stop = float(stop)
+
+    if not np.isfinite(grid_start) or not np.isfinite(grid_stop):
+        raise ValueError("start and stop must be finite.")
+    if grid_stop <= grid_start:
+        raise ValueError("stop must be greater than start.")
+
+    grid_tolerance = (
+        64.0
+        * np.finfo(float).eps
+        * max(1.0, abs(grid_start), abs(grid_stop))
+    )
+    for landscape_index, object_start, object_stop in object_grids:
+        if (
+            abs(object_start - grid_start) > grid_tolerance
+            or abs(object_stop - grid_stop) > grid_tolerance
+        ):
+            raise ValueError(
+                "All landscapes must use one common grid; landscape "
+                f"{landscape_index} uses [{object_start}, {object_stop}], "
+                f"not [{grid_start}, {grid_stop}]."
+            )
+
+    number_of_landscapes = len(values_list)
+    interval_count = num_steps - 1
+    feature_count = max_depth * interval_count
+
+    left_endpoints = np.zeros(
+        (number_of_landscapes, feature_count),
+        dtype=float,
+    )
+    right_endpoints = np.zeros_like(left_endpoints)
+
+    for landscape_index, values in enumerate(values_list):
+        used = values.shape[0] * interval_count
+        left_endpoints[landscape_index, :used] = values[:, :-1].reshape(-1)
+        right_endpoints[landscape_index, :used] = values[:, 1:].reshape(-1)
+
+    grid_step = (grid_stop - grid_start) / interval_count
+    left_left = left_endpoints @ left_endpoints.T
+    right_right = right_endpoints @ right_endpoints.T
+    left_right = left_endpoints @ right_endpoints.T
+
+    gram = (grid_step / 6.0) * (
+        2.0 * left_left
+        + 2.0 * right_right
+        + left_right
+        + left_right.T
+    )
+
+    # Remove harmless BLAS-level asymmetry before quadratic forms.
+    return 0.5 * (gram + gram.T)
+
+
+def permutation_pl_test_fast(
+    pl_list1,
+    pl_list2,
+    seed=42,
+    num_perms=1000,
+    start=None,
+    stop=None,
+):
+    """Fast permutation test for equality of mean persistence landscapes.
+
+    This is the fixed-grid Gram-matrix version of ``permutation_pl_test``.
+    It computes all pairwise L2 inner products once, then evaluates the
+    observed and permuted squared distances between sample means as quadratic
+    forms.  Thus it avoids repeated averaging and grid snapping inside the
+    permutation loop.
+
+    Parameters
+    ----------
+    pl_list1, pl_list2 : sequence
+        Nonempty samples of ``PersLandscapeApprox`` objects or numeric arrays
+        with shape ``(depth, num_steps)``.  Every item must use the same grid.
+    seed : int or None, default=42
+        Seed for a local Python random-number generator.  The global random
+        state is not modified.
+    num_perms : int, default=1000
+        Number of random label permutations.
+    start, stop : float or None
+        Optional common grid endpoints.  These are normally inferred from
+        ``PersLandscapeApprox`` inputs.  They may be omitted for raw arrays
+        because their common scale does not affect the p-value.
+
+    Returns
+    -------
+    float
+        Monte Carlo permutation p-value with the plus-one correction.
+    """
+    pl_list1 = list(pl_list1)
+    pl_list2 = list(pl_list2)
+    n = len(pl_list1)
+    m = len(pl_list2)
+
+    if n == 0 or m == 0:
+        raise ValueError("Both PL samples must be nonempty.")
+    if isinstance(num_perms, (bool, np.bool_)):
+        raise ValueError("num_perms must be a positive integer.")
+    try:
+        integer_num_perms = int(num_perms)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("num_perms must be a positive integer.") from exc
+    if integer_num_perms != num_perms or integer_num_perms < 1:
+        raise ValueError("num_perms must be a positive integer.")
+    num_perms = integer_num_perms
+
+    combined = pl_list1 + pl_list2
+    total = n + m
+    gram = landscape_l2_gram(combined, start=start, stop=stop)
+
+    # Row 0 is the observed split; rows 1:B are random splits.
+    coefficients = np.full(
+        (num_perms + 1, total),
+        -1.0 / m,
+        dtype=float,
+    )
+    coefficients[0, :n] = 1.0 / n
+
+    rng = random.Random(seed)
+    population = range(total)
+    for permutation_index in range(1, num_perms + 1):
+        group_x = rng.sample(population, n)
+        coefficients[permutation_index, group_x] = 1.0 / n
+
+    squared_statistics = np.einsum(
+        "bi,ij,bj->b",
+        coefficients,
+        gram,
+        coefficients,
+        optimize=True,
+    )
+    squared_statistics = np.maximum(squared_statistics, 0.0)
+
+    observed_squared = float(squared_statistics[0])
+    numerical_tolerance = (
+        64.0
+        * np.finfo(float).eps
+        * max(1.0, float(np.max(squared_statistics)))
+    )
+    exceedances = np.count_nonzero(
+        squared_statistics[1:]
+        >= observed_squared - numerical_tolerance
+    )
+
+    return float((exceedances + 1) / (num_perms + 1))
